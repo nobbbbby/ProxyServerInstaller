@@ -1,0 +1,47 @@
+# TUIC One-Click Installer
+
+This repository provides `install-tuic.sh`, a one-click installer for:
+
+- Latest stable TUIC server release from GitHub
+- Dual-stack listener (`[::]:443` by default)
+- HTTPS frontend on TCP/443 via Nginx or Caddy
+- ACME certificate issuance/renewal with shared cert for TUIC + frontend
+- Firewall automation (`ufw`, `firewalld`, or `iptables/ip6tables` fallback)
+
+## Quick start
+
+Run as root on a supported distro:
+
+- Ubuntu 22.04/24.04
+- Debian 12
+- CentOS/RHEL-family (systemd-based)
+
+```bash
+sudo ./install-tuic.sh \
+  --domain example.com \
+  --email admin@example.com \
+  --non-interactive
+```
+
+## CLI options
+
+```text
+--domain <fqdn>
+--email <email>
+--port-udp <port>        (default: 443)
+--https-front <nginx|caddy> (default: nginx)
+--site-root <path>       (default: /var/www/https-front)
+--repo <owner/repo>      (default: Itsusinn/tuic)
+--non-interactive
+--update
+--dry-run
+--force
+--help
+```
+
+## Notes
+
+- The script validates both A and AAAA DNS records and checks dual-stack prerequisites.
+- ACME uses `acme.sh` in standalone mode.
+- Installer metadata and summary are stored in `/etc/tuic/`.
+- If `/etc/tuic/.env` exists, interactive runs ask whether to reuse the last saved configuration.
