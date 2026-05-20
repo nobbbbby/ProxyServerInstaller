@@ -27,6 +27,7 @@ NON_INTERACTIVE="false"
 DRY_RUN="false"
 FORCE="false"
 UPDATE_MODE="false"
+UPGRADE_CORE_MODE="false"
 OS_FAMILY=""
 declare -a PKG_INSTALL_CMD=()
 declare -a PKG_UPDATE_CMD=()
@@ -35,6 +36,7 @@ TAG=""
 ASSET_URL=""
 TUIC_VERSION=""
 TUIC_REPO="${TUIC_REPO_DEFAULT}"
+TUIC_REPO_EXPLICIT="false"
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -54,6 +56,7 @@ Options:
   --repo <owner/repo>      TUIC GitHub repo (default: Itsusinn/tuic)
   --non-interactive        Fail instead of prompting for missing options
   --update                 Update mode; reuse /etc/tuic/.env when possible
+  --upgrade-core           Upgrade only the TUIC server binary from the selected repo
   --dry-run                Show planned actions without making changes
   --force                  Overwrite existing configs without prompts
   --help                   Show this help
@@ -94,9 +97,10 @@ parse_args() {
       --port-udp) UDP_PORT="${2:-}"; shift 2 ;;
       --https-front) HTTPS_FRONT="${2:-}"; shift 2 ;;
       --site-root) SITE_ROOT="${2:-}"; shift 2 ;;
-      --repo) TUIC_REPO="${2:-}"; shift 2 ;;
+      --repo) TUIC_REPO="${2:-}"; TUIC_REPO_EXPLICIT="true"; shift 2 ;;
       --non-interactive) NON_INTERACTIVE="true"; shift ;;
       --update) UPDATE_MODE="true"; shift ;;
+      --upgrade-core|--upgrade-tuic-core) UPGRADE_CORE_MODE="true"; shift ;;
       --dry-run) DRY_RUN="true"; shift ;;
       --force) FORCE="true"; shift ;;
       --help) usage; exit 0 ;;
@@ -165,7 +169,9 @@ load_existing_env() {
   UDP_PORT="${UDP_PORT:-${saved_port:-${DEFAULT_UDP_PORT}}}"
   HTTPS_FRONT="${HTTPS_FRONT:-${saved_frontend:-${DEFAULT_HTTPS_FRONT}}}"
   SITE_ROOT="${SITE_ROOT:-${saved_site_root:-${DEFAULT_SITE_ROOT}}}"
-  TUIC_REPO="${TUIC_REPO:-${saved_repo:-${TUIC_REPO_DEFAULT}}}"
+  if [[ "${TUIC_REPO_EXPLICIT}" != "true" && -n "${saved_repo}" ]]; then
+    TUIC_REPO="${saved_repo}"
+  fi
   log "Loaded existing settings from ${TUIC_ENV}"
 }
 
@@ -223,6 +229,16 @@ ensure_base_dependencies() {
     run_cmd "${PKG_INSTALL_CMD[@]}" curl jq tar openssl ca-certificates iproute2 dnsutils socat
   else
     run_cmd "${PKG_INSTALL_CMD[@]}" curl jq tar openssl ca-certificates iproute bind-utils socat
+  fi
+}
+
+ensure_core_upgrade_dependencies() {
+  log "Installing TUIC core upgrade dependencies"
+  run_cmd "${PKG_UPDATE_CMD[@]}"
+  if [[ "${OS_FAMILY}" == "debian" ]]; then
+    run_cmd "${PKG_INSTALL_CMD[@]}" curl jq ca-certificates
+  else
+    run_cmd "${PKG_INSTALL_CMD[@]}" curl jq ca-certificates
   fi
 }
 
@@ -411,6 +427,76 @@ install_tuic_binary() {
 
   run_cmd install -m 0755 "${bin_file}" "${TUIC_BIN}"
   run_cmd rm -rf "${tmp_dir}"
+}
+
+restart_tuic_service() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[dry-run] systemctl restart tuic"
+    return 0
+  fi
+  if systemctl cat tuic >/dev/null 2>&1; then
+    systemctl restart tuic
+  else
+    warn "tuic.service is not installed; binary upgraded but service was not restarted."
+  fi
+}
+
+verify_tuic_service_if_installed() {
+  [[ "${DRY_RUN}" == "true" ]] && return 0
+  if systemctl cat tuic >/dev/null 2>&1; then
+    systemctl is-active --quiet tuic || { err "TUIC service is not active after upgrade"; exit 16; }
+  fi
+}
+
+persist_core_upgrade_metadata() {
+  [[ -f "${TUIC_ENV}" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk -v version="${TUIC_VERSION}" -v tag="${TAG}" -v asset="${ASSET_URL}" -v repo="${TUIC_REPO}" -v updated="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    BEGIN {
+      seen_version=0
+      seen_tag=0
+      seen_asset=0
+      seen_repo=0
+      seen_updated=0
+    }
+    /^TUIC_VERSION=/ { print "TUIC_VERSION=" version; seen_version=1; next }
+    /^TUIC_TAG=/ { print "TUIC_TAG=" tag; seen_tag=1; next }
+    /^TUIC_ASSET_URL=/ { print "TUIC_ASSET_URL=" asset; seen_asset=1; next }
+    /^TUIC_REPO_SAVED=/ { print "TUIC_REPO_SAVED=" repo; seen_repo=1; next }
+    /^UPDATED_AT=/ { print "UPDATED_AT=" updated; seen_updated=1; next }
+    { print }
+    END {
+      if (!seen_version) print "TUIC_VERSION=" version
+      if (!seen_tag) print "TUIC_TAG=" tag
+      if (!seen_asset) print "TUIC_ASSET_URL=" asset
+      if (!seen_repo) print "TUIC_REPO_SAVED=" repo
+      if (!seen_updated) print "UPDATED_AT=" updated
+    }
+  ' "${TUIC_ENV}" > "${tmp}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[dry-run] update TUIC metadata in ${TUIC_ENV}"
+    rm -f "${tmp}"
+    return 0
+  fi
+  run_cmd install -m 0600 "${tmp}" "${TUIC_ENV}"
+  run_cmd rm -f "${tmp}"
+}
+
+print_upgrade_result() {
+  cat <<EOF
+TUIC core upgrade completed.
+
+TUIC repo: ${TUIC_REPO}
+TUIC version: ${TUIC_VERSION}
+Binary: ${TUIC_BIN}
+
+Preserved:
+  - ${TUIC_CONFIG}
+  - ${TUIC_SERVICE}
+  - ${TUIC_ENV}
+
+EOF
 }
 
 backup_if_exists() {
@@ -738,6 +824,23 @@ EOF
 main() {
   parse_args "$@"
   require_root
+
+  if [[ "${UPGRADE_CORE_MODE}" == "true" ]]; then
+    if [[ -f "${TUIC_ENV}" ]]; then
+      load_existing_env
+    fi
+    [[ "${TUIC_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Invalid --repo format; expected owner/repo"
+    detect_os
+    detect_arch
+    ensure_core_upgrade_dependencies
+    resolve_latest_tuic_release
+    install_tuic_binary
+    restart_tuic_service
+    verify_tuic_service_if_installed
+    persist_core_upgrade_metadata
+    print_upgrade_result
+    return 0
+  fi
 
   if [[ -f "${TUIC_ENV}" ]]; then
     if [[ "${UPDATE_MODE}" == "true" ]]; then

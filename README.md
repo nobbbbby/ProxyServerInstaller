@@ -34,9 +34,26 @@ sudo ./install-tuic.sh \
 --repo <owner/repo>      (default: Itsusinn/tuic)
 --non-interactive
 --update
+--upgrade-core           upgrade only the TUIC server binary
 --dry-run
 --force
 --help
+```
+
+## Upgrade TUIC core only
+
+To upgrade only the TUIC server binary while preserving the existing config,
+certificates, HTTPS frontend, and firewall rules:
+
+```bash
+sudo ./install-tuic.sh --upgrade-core
+```
+
+The command reuses `/etc/tuic/.env` when present. To upgrade from a different
+TUIC GitHub repository for this run:
+
+```bash
+sudo ./install-tuic.sh --upgrade-core --repo owner/repo
 ```
 
 ## Notes
