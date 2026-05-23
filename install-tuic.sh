@@ -535,15 +535,15 @@ generate_tuic_config() {
   backup_if_exists "${TUIC_CONFIG}"
   write_file "${TUIC_CONFIG}" <<EOF
 {
-  \"server\": \"[::]:${UDP_PORT}\",
-  \"users\": {
-    \"${uuid}\": \"${pass}\"
+  "server": "[::]:${UDP_PORT}",
+  "users": {
+    "${uuid}": "${pass}"
   },
-  \"certificate\": \"${CERT_FULLCHAIN}\",
-  \"private_key\": \"${CERT_KEY}\",
-  \"congestion_control\": \"bbr\",
-  \"alpn\": [\"h3\"],
-  \"log_level\": \"warn\"
+  "certificate": "${CERT_FULLCHAIN}",
+  "private_key": "${CERT_KEY}",
+  "congestion_control": "bbr",
+  "alpn": ["h3"],
+  "log_level": "warn"
 }
 EOF
   run_cmd chmod 600 "${TUIC_CONFIG}"
@@ -585,10 +585,10 @@ write_site_content() {
   run_cmd mkdir -p "${SITE_ROOT}"
   write_file "${SITE_ROOT}/index.html" <<'EOF'
 <!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Service Status</title>
   <style>
     body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f6f8;color:#1f2937;margin:0}
@@ -599,9 +599,9 @@ write_site_content() {
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
+  <div class="wrap">
     <h1>Welcome</h1>
-    <p><span class=\"ok\">Online</span></p>
+    <p><span class="ok">Online</span></p>
     <p>This endpoint serves standard HTTPS traffic.</p>
   </div>
 </body>
@@ -624,8 +624,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name ${WEB_DOMAIN};
 
     ssl_certificate ${CERT_FULLCHAIN};
@@ -635,7 +636,7 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
-    add_header Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\" always;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options SAMEORIGIN always;
     add_header Referrer-Policy no-referrer-when-downgrade always;
@@ -669,10 +670,10 @@ https://${WEB_DOMAIN} {
     root * ${SITE_ROOT}
     file_server
     header {
-        Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\"
-        X-Content-Type-Options \"nosniff\"
-        X-Frame-Options \"SAMEORIGIN\"
-        Referrer-Policy \"no-referrer-when-downgrade\"
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "no-referrer-when-downgrade"
     }
 }
 EOF
@@ -766,16 +767,16 @@ write_summary() {
   fi
   write_file "${TUIC_SUMMARY}" <<EOF
 {
-  \"script_version\": \"${SCRIPT_VERSION}\",
-  \"timestamp_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
-  \"domain\": \"${WEB_DOMAIN}\",
-  \"tuic_repo\": \"${TUIC_REPO}\",
-  \"tuic_version\": \"${TUIC_VERSION}\",
-  \"udp_port\": ${UDP_PORT},
-  \"https_front\": \"${HTTPS_FRONT}\",
-  \"site_root\": \"${SITE_ROOT}\",
-  \"cert_expiry\": \"${cert_expiry}\",
-  \"dual_stack_bind\": \"[::]:${UDP_PORT}\"
+  "script_version": "${SCRIPT_VERSION}",
+  "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "domain": "${WEB_DOMAIN}",
+  "tuic_repo": "${TUIC_REPO}",
+  "tuic_version": "${TUIC_VERSION}",
+  "udp_port": ${UDP_PORT},
+  "https_front": "${HTTPS_FRONT}",
+  "site_root": "${SITE_ROOT}",
+  "cert_expiry": "${cert_expiry}",
+  "dual_stack_bind": "[::]:${UDP_PORT}"
 }
 EOF
   run_cmd chmod 600 "${TUIC_SUMMARY}"
