@@ -35,10 +35,29 @@ sudo ./install-tuic.sh \
 --non-interactive
 --update
 --upgrade-core           upgrade only the TUIC server binary
+--status                 show TUIC/frontend service status
+--restart                restart TUIC and the configured HTTPS frontend
 --dry-run
 --force
 --help
 ```
+
+## Operations
+
+Check the current TUIC and HTTPS frontend status:
+
+```bash
+sudo ./install-tuic.sh --status
+```
+
+Restart all relevant services:
+
+```bash
+sudo ./install-tuic.sh --restart
+```
+
+Both commands reuse `/etc/tuic/.env` when present, including whether the
+frontend is `nginx` or `caddy`.
 
 ## Upgrade TUIC core only
 

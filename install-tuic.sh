@@ -28,6 +28,8 @@ DRY_RUN="false"
 FORCE="false"
 UPDATE_MODE="false"
 UPGRADE_CORE_MODE="false"
+STATUS_MODE="false"
+RESTART_MODE="false"
 OS_FAMILY=""
 declare -a PKG_INSTALL_CMD=()
 declare -a PKG_UPDATE_CMD=()
@@ -57,6 +59,8 @@ Options:
   --non-interactive        Fail instead of prompting for missing options
   --update                 Update mode; reuse /etc/tuic/.env when possible
   --upgrade-core           Upgrade only the TUIC server binary from the selected repo
+  --status                 Show TUIC/frontend service status and listening sockets
+  --restart                Restart TUIC and the configured HTTPS frontend
   --dry-run                Show planned actions without making changes
   --force                  Overwrite existing configs without prompts
   --help                   Show this help
@@ -101,12 +105,79 @@ parse_args() {
       --non-interactive) NON_INTERACTIVE="true"; shift ;;
       --update) UPDATE_MODE="true"; shift ;;
       --upgrade-core|--upgrade-tuic-core) UPGRADE_CORE_MODE="true"; shift ;;
+      --status|status) STATUS_MODE="true"; shift ;;
+      --restart|restart) RESTART_MODE="true"; shift ;;
       --dry-run) DRY_RUN="true"; shift ;;
       --force) FORCE="true"; shift ;;
       --help) usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
+}
+
+load_runtime_env() {
+  local key value line
+  [[ -f "${TUIC_ENV}" ]] || return 0
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    [[ "${line}" == *"="* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "${key}" in
+      DOMAIN) WEB_DOMAIN="${value}" ;;
+      EMAIL) ACME_EMAIL="${value}" ;;
+      PORT_UDP) UDP_PORT="${value}" ;;
+      FRONTEND) HTTPS_FRONT="${value}" ;;
+      SITE_ROOT_PATH) SITE_ROOT="${value}" ;;
+      TUIC_REPO_SAVED) TUIC_REPO="${value}" ;;
+    esac
+  done < "${TUIC_ENV}"
+}
+
+configured_https_front() {
+  if [[ "${HTTPS_FRONT}" =~ ^(nginx|caddy)$ ]]; then
+    printf '%s\n' "${HTTPS_FRONT}"
+    return 0
+  fi
+  if systemctl is-active --quiet caddy && ! systemctl is-active --quiet nginx; then
+    printf 'caddy\n'
+    return 0
+  fi
+  printf '%s\n' "${DEFAULT_HTTPS_FRONT}"
+}
+
+show_current_status() {
+  local frontend
+  load_runtime_env
+  frontend="$(configured_https_front)"
+
+  log "Service state"
+  systemctl --no-pager --full status tuic "${frontend}" || true
+
+  log "Active check"
+  systemctl is-active tuic "${frontend}" || true
+
+  log "Listening sockets"
+  ss -H -l -n -u "sport = :${UDP_PORT}" || true
+  ss -H -l -n -t "sport = :443" || true
+
+  if [[ -f "${TUIC_SUMMARY}" ]]; then
+    log "Install summary"
+    cat "${TUIC_SUMMARY}"
+  fi
+}
+
+restart_relevant_services() {
+  local frontend
+  load_runtime_env
+  frontend="$(configured_https_front)"
+
+  log "Restarting TUIC and ${frontend}"
+  run_cmd systemctl restart tuic "${frontend}"
+
+  log "Service state"
+  systemctl is-active tuic "${frontend}"
 }
 
 ask_if_missing() {
@@ -825,6 +896,20 @@ EOF
 main() {
   parse_args "$@"
   require_root
+
+  if [[ "${STATUS_MODE}" == "true" && "${RESTART_MODE}" == "true" ]]; then
+    die "Use only one of --status or --restart."
+  fi
+
+  if [[ "${STATUS_MODE}" == "true" ]]; then
+    show_current_status
+    return 0
+  fi
+
+  if [[ "${RESTART_MODE}" == "true" ]]; then
+    restart_relevant_services
+    return 0
+  fi
 
   if [[ "${UPGRADE_CORE_MODE}" == "true" ]]; then
     if [[ -f "${TUIC_ENV}" ]]; then
