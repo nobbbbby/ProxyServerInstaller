@@ -78,6 +78,8 @@ sudo ./install-tuic.sh --upgrade-core --repo owner/repo
 ## Notes
 
 - The script validates both A and AAAA DNS records and checks dual-stack prerequisites.
-- ACME uses `acme.sh` in standalone mode.
+- ACME uses `acme.sh` in standalone mode. The installer registers renewal hooks
+  that stop the HTTPS frontend before the challenge, start it afterwards, and
+  restart TUIC after a renewed certificate is installed.
 - Installer metadata and summary are stored in `/etc/tuic/`.
 - If `/etc/tuic/.env` exists, interactive runs ask whether to reuse the last saved configuration.

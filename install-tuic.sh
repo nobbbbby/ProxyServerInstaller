@@ -18,6 +18,8 @@ CERT_KEY="${CERT_DIR}/privkey.pem"
 ACME_HOME="/root/.acme.sh"
 ACME_BIN="${ACME_HOME}/acme.sh"
 RELOAD_HOOK="/usr/local/bin/tuic-cert-reload.sh"
+ACME_PRE_HOOK="/usr/local/bin/tuic-acme-pre-hook.sh"
+ACME_POST_HOOK="/usr/local/bin/tuic-acme-post-hook.sh"
 WEB_DOMAIN=""
 ACME_EMAIL=""
 UDP_PORT="${DEFAULT_UDP_PORT}"
@@ -419,14 +421,79 @@ install_acme() {
   [[ "${DRY_RUN}" == "true" ]] || [[ -x "${ACME_BIN}" ]] || die "acme.sh install failed"
 }
 
+acme_domain_conf_path() {
+  local candidate
+  for candidate in \
+    "${ACME_HOME}/${WEB_DOMAIN}_ecc/${WEB_DOMAIN}.conf" \
+    "${ACME_HOME}/${WEB_DOMAIN}/${WEB_DOMAIN}.conf"; do
+    if [[ -f "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+acme_encoded_conf_value() {
+  local value="$1"
+  printf '__ACME_BASE64__START_%s__ACME_BASE64__END_' "$(printf '%s' "${value}" | openssl base64 -A)"
+}
+
+set_acme_domain_conf_value() {
+  local conf key value encoded escaped
+  key="$1"
+  value="$2"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[dry-run] update acme.sh domain config ${key}"
+    return 0
+  fi
+  conf="$(acme_domain_conf_path)" || {
+    warn "Could not find acme.sh domain config for ${WEB_DOMAIN}; renewal hooks were not patched."
+    return 0
+  }
+  encoded="$(acme_encoded_conf_value "${value}")"
+  escaped="$(printf '%s' "${encoded}" | sed 's/[\/&]/\\&/g')"
+  if grep -q "^${key}=" "${conf}"; then
+    sed -i.bak "s/^${key}=.*/${key}='${escaped}'/" "${conf}"
+  else
+    printf "%s='%s'\n" "${key}" "${encoded}" >> "${conf}"
+  fi
+}
+
+persist_acme_renewal_hooks() {
+  set_acme_domain_conf_value "Le_PreHook" "${ACME_PRE_HOOK}"
+  set_acme_domain_conf_value "Le_PostHook" "${ACME_POST_HOOK}"
+}
+
 issue_or_renew_cert() {
   log "Issuing/renewing certificate for ${WEB_DOMAIN}"
   run_cmd mkdir -p "${CERT_DIR}"
   if ! run_cmd "${ACME_BIN}" --register-account -m "${ACME_EMAIL}" --server letsencrypt; then
     warn "ACME account registration returned non-zero; continuing."
   fi
+  write_file "${ACME_PRE_HOOK}" <<HOOK
+#!/usr/bin/env bash
+set -e
+systemctl stop ${HTTPS_FRONT} >/dev/null 2>&1 || true
+HOOK
+  write_file "${ACME_POST_HOOK}" <<HOOK
+#!/usr/bin/env bash
+set -e
+systemctl start ${HTTPS_FRONT} >/dev/null 2>&1 || true
+HOOK
+  run_cmd chmod 750 "${ACME_PRE_HOOK}" "${ACME_POST_HOOK}"
   local -a issue_cmd
-  issue_cmd=("${ACME_BIN}" --issue -d "${WEB_DOMAIN}" --standalone --keylength ec-256 --server letsencrypt --ecc)
+  issue_cmd=(
+    "${ACME_BIN}"
+    --issue
+    -d "${WEB_DOMAIN}"
+    --standalone
+    --keylength ec-256
+    --server letsencrypt
+    --ecc
+    --pre-hook "${ACME_PRE_HOOK}"
+    --post-hook "${ACME_POST_HOOK}"
+  )
   if [[ "${FORCE}" == "true" ]]; then
     issue_cmd+=(--force)
   fi
@@ -437,6 +504,7 @@ issue_or_renew_cert() {
       warn "ACME issue step returned non-zero; continuing and trying to install existing cert."
     fi
   fi
+  persist_acme_renewal_hooks
   write_file "${RELOAD_HOOK}" <<HOOK
 #!/usr/bin/env bash
 set -e
