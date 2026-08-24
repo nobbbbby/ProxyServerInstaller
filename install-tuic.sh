@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 DEFAULT_UDP_PORT="443"
 DEFAULT_HTTPS_FRONT="nginx"
 DEFAULT_SITE_ROOT="/var/www/https-front"
@@ -20,6 +20,8 @@ ACME_BIN="${ACME_HOME}/acme.sh"
 RELOAD_HOOK="/usr/local/bin/tuic-cert-reload.sh"
 ACME_PRE_HOOK="/usr/local/bin/tuic-acme-pre-hook.sh"
 ACME_POST_HOOK="/usr/local/bin/tuic-acme-post-hook.sh"
+ACME_RENEW_SERVICE="/etc/systemd/system/tuic-cert-renew.service"
+ACME_RENEW_TIMER="/etc/systemd/system/tuic-cert-renew.timer"
 WEB_DOMAIN=""
 ACME_EMAIL=""
 UDP_PORT="${DEFAULT_UDP_PORT}"
@@ -32,6 +34,7 @@ UPDATE_MODE="false"
 UPGRADE_CORE_MODE="false"
 STATUS_MODE="false"
 RESTART_MODE="false"
+REPAIR_CERT_RENEWAL_MODE="false"
 OS_FAMILY=""
 declare -a PKG_INSTALL_CMD=()
 declare -a PKG_UPDATE_CMD=()
@@ -63,6 +66,7 @@ Options:
   --upgrade-core           Upgrade only the TUIC server binary from the selected repo
   --status                 Show TUIC/frontend service status and listening sockets
   --restart                Restart TUIC and the configured HTTPS frontend
+  --repair-cert-renewal    Repair and verify automatic certificate renewal only
   --dry-run                Show planned actions without making changes
   --force                  Overwrite existing configs without prompts
   --help                   Show this help
@@ -109,6 +113,7 @@ parse_args() {
       --upgrade-core|--upgrade-tuic-core) UPGRADE_CORE_MODE="true"; shift ;;
       --status|status) STATUS_MODE="true"; shift ;;
       --restart|restart) RESTART_MODE="true"; shift ;;
+      --repair-cert-renewal) REPAIR_CERT_RENEWAL_MODE="true"; shift ;;
       --dry-run) DRY_RUN="true"; shift ;;
       --force) FORCE="true"; shift ;;
       --help) usage; exit 0 ;;
@@ -156,6 +161,10 @@ show_current_status() {
 
   log "Service state"
   systemctl --no-pager --full status tuic "${frontend}" || true
+
+  log "Certificate renewal timer state"
+  systemctl --no-pager --full status tuic-cert-renew.timer || true
+  systemctl list-timers --all --no-pager tuic-cert-renew.timer || true
 
   log "Active check"
   systemctl is-active tuic "${frontend}" || true
@@ -465,23 +474,84 @@ persist_acme_renewal_hooks() {
   set_acme_domain_conf_value "Le_PostHook" "${ACME_POST_HOOK}"
 }
 
+write_acme_renewal_hooks() {
+  write_file "${ACME_PRE_HOOK}" <<HOOK
+#!/usr/bin/env bash
+set -e
+echo "Stopping ${HTTPS_FRONT} for the ACME standalone challenge"
+systemctl stop ${HTTPS_FRONT}
+HOOK
+  write_file "${ACME_POST_HOOK}" <<HOOK
+#!/usr/bin/env bash
+set -e
+echo "Starting ${HTTPS_FRONT} after the ACME standalone challenge"
+systemctl start ${HTTPS_FRONT}
+HOOK
+  run_cmd chmod 750 "${ACME_PRE_HOOK}" "${ACME_POST_HOOK}"
+}
+
+write_certificate_reload_hook() {
+  write_file "${RELOAD_HOOK}" <<HOOK
+#!/usr/bin/env bash
+set -e
+echo "Reloading ${HTTPS_FRONT} with the renewed certificate"
+systemctl reload ${HTTPS_FRONT} || systemctl restart ${HTTPS_FRONT}
+if systemctl cat tuic >/dev/null 2>&1; then
+  echo "Restarting TUIC with the renewed certificate"
+  systemctl restart tuic
+fi
+HOOK
+  run_cmd chmod 750 "${RELOAD_HOOK}"
+}
+
+install_acme_renewal_timer() {
+  log "Installing persistent certificate renewal timer"
+  write_file "${ACME_RENEW_SERVICE}" <<EOF
+[Unit]
+Description=Renew TUIC TLS certificate with acme.sh
+Documentation=https://github.com/acmesh-official/acme.sh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+UMask=0077
+ExecStart=${ACME_BIN} --cron --home ${ACME_HOME}
+EOF
+
+  write_file "${ACME_RENEW_TIMER}" <<'EOF'
+[Unit]
+Description=Check TUIC TLS certificate renewal every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+RandomizedDelaySec=45m
+Persistent=true
+AccuracySec=1m
+Unit=tuic-cert-renew.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  run_cmd chmod 644 "${ACME_RENEW_SERVICE}" "${ACME_RENEW_TIMER}"
+  run_cmd systemctl daemon-reload
+  run_cmd systemctl enable --now tuic-cert-renew.timer
+  if [[ "${DRY_RUN}" != "true" ]]; then
+    systemctl is-enabled --quiet tuic-cert-renew.timer || die "Certificate renewal timer is not enabled"
+    systemctl is-active --quiet tuic-cert-renew.timer || die "Certificate renewal timer is not active"
+    log "Certificate renewal timer enabled; logs are available with: journalctl -u tuic-cert-renew.service"
+  fi
+}
+
 issue_or_renew_cert() {
   log "Issuing/renewing certificate for ${WEB_DOMAIN}"
   run_cmd mkdir -p "${CERT_DIR}"
   if ! run_cmd "${ACME_BIN}" --register-account -m "${ACME_EMAIL}" --server letsencrypt; then
     warn "ACME account registration returned non-zero; continuing."
   fi
-  write_file "${ACME_PRE_HOOK}" <<HOOK
-#!/usr/bin/env bash
-set -e
-systemctl stop ${HTTPS_FRONT} >/dev/null 2>&1 || true
-HOOK
-  write_file "${ACME_POST_HOOK}" <<HOOK
-#!/usr/bin/env bash
-set -e
-systemctl start ${HTTPS_FRONT} >/dev/null 2>&1 || true
-HOOK
-  run_cmd chmod 750 "${ACME_PRE_HOOK}" "${ACME_POST_HOOK}"
+  write_acme_renewal_hooks
   local -a issue_cmd
   issue_cmd=(
     "${ACME_BIN}"
@@ -505,13 +575,7 @@ HOOK
     fi
   fi
   persist_acme_renewal_hooks
-  write_file "${RELOAD_HOOK}" <<HOOK
-#!/usr/bin/env bash
-set -e
-systemctl reload ${HTTPS_FRONT} >/dev/null 2>&1 || systemctl restart ${HTTPS_FRONT} >/dev/null 2>&1 || true
-systemctl restart tuic >/dev/null 2>&1 || true
-HOOK
-  run_cmd chmod 750 "${RELOAD_HOOK}"
+  write_certificate_reload_hook
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "[dry-run] ${ACME_BIN} --install-cert -d ${WEB_DOMAIN} --ecc --fullchain-file ${CERT_FULLCHAIN} --key-file ${CERT_KEY} --reloadcmd '${RELOAD_HOOK}'"
   else
@@ -522,6 +586,26 @@ HOOK
   fi
   [[ "${DRY_RUN}" == "true" ]] || [[ -s "${CERT_FULLCHAIN}" && -s "${CERT_KEY}" ]] || { err "Certificate files are missing after ACME step"; exit 15; }
   run_cmd chmod 600 "${CERT_KEY}"
+}
+
+repair_certificate_renewal() {
+  [[ -f "${TUIC_ENV}" ]] || die "${TUIC_ENV} is missing; run the full installer first."
+  load_existing_env
+  validate_input
+  [[ -x "${ACME_BIN}" ]] || die "${ACME_BIN} is missing; run the full installer first."
+  acme_domain_conf_path >/dev/null || die "No acme.sh certificate configuration found for ${WEB_DOMAIN}."
+
+  log "Repairing automatic certificate renewal for ${WEB_DOMAIN}"
+  write_acme_renewal_hooks
+  persist_acme_renewal_hooks
+  write_certificate_reload_hook
+  install_acme_renewal_timer
+
+  if [[ "${DRY_RUN}" != "true" ]]; then
+    log "Running an immediate renewal check"
+    systemctl start tuic-cert-renew.service
+    systemctl --no-pager --full status tuic-cert-renew.service || true
+  fi
 }
 
 resolve_latest_tuic_release() {
@@ -962,11 +1046,20 @@ EOF
 }
 
 main() {
+  local operation_count=0
   parse_args "$@"
   require_root
 
-  if [[ "${STATUS_MODE}" == "true" && "${RESTART_MODE}" == "true" ]]; then
-    die "Use only one of --status or --restart."
+  [[ "${STATUS_MODE}" == "true" ]] && ((operation_count += 1))
+  [[ "${RESTART_MODE}" == "true" ]] && ((operation_count += 1))
+  [[ "${UPDATE_MODE}" == "true" ]] && ((operation_count += 1))
+  [[ "${UPGRADE_CORE_MODE}" == "true" ]] && ((operation_count += 1))
+  [[ "${REPAIR_CERT_RENEWAL_MODE}" == "true" ]] && ((operation_count += 1))
+  (( operation_count <= 1 )) || die "Use only one operation mode at a time."
+
+  if [[ "${REPAIR_CERT_RENEWAL_MODE}" == "true" ]]; then
+    repair_certificate_renewal
+    return 0
   fi
 
   if [[ "${STATUS_MODE}" == "true" ]]; then
@@ -1032,6 +1125,7 @@ main() {
   configure_https_front
   configure_firewall
   start_services
+  install_acme_renewal_timer
   verify_health
   persist_env
   write_summary
