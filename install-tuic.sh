@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.2.1"
 DEFAULT_UDP_PORT="443"
 DEFAULT_HTTPS_FRONT="nginx"
 DEFAULT_SITE_ROOT="/var/www/https-front"
@@ -610,18 +610,35 @@ repair_certificate_renewal() {
 
 resolve_latest_tuic_release() {
   log "Resolving latest stable release from ${TUIC_REPO}"
-  local api release_json asset_pattern
+  local api release_json stable_release asset_pattern
   api="https://api.github.com/repos/${TUIC_REPO}/releases"
   release_json="$(curl -fsSL "${api}")" || { err "Failed to fetch releases from ${api}"; exit 14; }
 
-  TAG="$(jq -r '[.[] | select(.draft==false and .prerelease==false)][0].tag_name // empty' <<<"${release_json}")"
+  # Some upstream projects publish tags such as v2.0.0-dev3 without setting
+  # GitHub's prerelease flag. Require a release tag that ends in a complete
+  # stable semantic version so those builds cannot silently become the default.
+  stable_release="$(select_latest_stable_release <<<"${release_json}")"
+  TAG="$(jq -r '.tag_name // empty' <<<"${stable_release}")"
   [[ -n "${TAG}" ]] || { err "No stable release found in ${TUIC_REPO}"; exit 14; }
   TUIC_VERSION="${TAG}"
 
   asset_pattern="tuic-server.*${ARCH}.*linux.*(gnu|musl)"
-  ASSET_URL="$(jq -r --arg p "${asset_pattern}" '[.[] | select(.draft==false and .prerelease==false)][0].assets[]?.browser_download_url | select(test($p;"i"))' <<<"${release_json}" | head -n1)"
+  ASSET_URL="$(jq -r --arg p "${asset_pattern}" '.assets[]?.browser_download_url | select(test($p;"i"))' <<<"${stable_release}" | head -n1)"
   [[ -n "${ASSET_URL}" ]] || { err "No matching Linux asset found for ${ARCH} at ${TAG}"; exit 14; }
   log "Selected release: ${TAG}"
+}
+
+# GitHub's prerelease field is publisher-controlled and is not sufficient on
+# its own. Accept plain semantic-version tags and conventional component tags
+# such as "tuic-server-1.0.0", but reject suffixes including -dev, -rc, and beta.
+select_latest_stable_release() {
+  jq -c '
+    [
+      .[]
+      | select(.draft == false and .prerelease == false)
+      | select(.tag_name | test("(^|[-_/])v?[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    ][0] // empty
+  '
 }
 
 install_tuic_binary() {
@@ -1132,4 +1149,6 @@ main() {
   print_result
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

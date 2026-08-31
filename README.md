@@ -76,6 +76,11 @@ TUIC GitHub repository for this run:
 sudo ./install-tuic.sh --upgrade-core --repo owner/repo
 ```
 
+Stable release selection checks both GitHub's draft/prerelease metadata and the
+release tag. Tags with development suffixes such as `-dev`, `-rc`, or `-beta`
+are not installed by default, even if the publisher did not mark the GitHub
+release as a prerelease.
+
 ## Repair certificate auto-renewal
 
 Servers installed with an older version may have a missing `acme.sh` cron entry
