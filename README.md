@@ -17,8 +17,19 @@ Run as root on a supported distro:
 - Debian 12
 - CentOS/RHEL-family (systemd-based)
 
+Download the installer and start setup (requires `curl` and `sudo`):
+
 ```bash
-sudo ./install-tuic.sh \
+curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/nobbbbby/ProxyServerInstaller/main/install-tuic.sh \
+  --output install-tuic.sh && chmod +x ./install-tuic.sh && sudo ./install-tuic.sh
+```
+
+Setup prompts for your domain and ACME email. Point the domain's DNS records at
+the server before running it. To supply the values without prompts after downloading:
+
+```bash
+sudo bash ./install-tuic.sh \
   --domain example.com \
   --email admin@example.com \
   --non-interactive
@@ -36,6 +47,7 @@ sudo ./install-tuic.sh \
 --non-interactive
 --update
 --upgrade-core           upgrade only the TUIC server binary
+--upgrade-script         update the local installer file
 --source-url <url>        build core from an HTTPS or SSH Git remote
 --source-ref <ref>        branch, tag, or full commit SHA (default: HEAD)
 --status                 show TUIC/frontend service status
@@ -61,6 +73,25 @@ sudo ./install-tuic.sh --restart
 
 Both commands reuse `/etc/tuic/.env` when present, including whether the
 frontend is `nginx` or `caddy`.
+
+## Update the installer itself
+
+```bash
+sudo bash ./install-tuic.sh --upgrade-script
+```
+
+This downloads the latest installer from this repository's `main` branch,
+checks its header, version marker, and Bash syntax, then atomically replaces
+the local script and makes it executable. Run the script again afterwards to
+use the updated version. Download or validation failures leave the existing
+file intact. Self-update requires a saved, regular script file; symlinks and
+piped input are not supported. Use `--dry-run` to preview without downloading.
+
+This operation only updates the installer file. Use `--upgrade-core` to upgrade
+TUIC, or `--update` to rerun setup with saved configuration. Operation modes
+cannot be combined. For older copies without `--upgrade-script`, repeat the
+`curl` download step from Quick start, omitting the commands after `&&` to avoid
+starting setup again.
 
 ## Upgrade TUIC core only
 
