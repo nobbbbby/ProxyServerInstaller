@@ -36,6 +36,8 @@ sudo ./install-tuic.sh \
 --non-interactive
 --update
 --upgrade-core           upgrade only the TUIC server binary
+--source-url <url>        build core from an HTTPS or SSH Git remote
+--source-ref <ref>        branch, tag, or full commit SHA (default: HEAD)
 --status                 show TUIC/frontend service status
 --restart                restart TUIC and the configured HTTPS frontend
 --dry-run
@@ -80,6 +82,48 @@ Stable release selection checks both GitHub's draft/prerelease metadata and the
 release tag. Tags with development suffixes such as `-dev`, `-rc`, or `-beta`
 are not installed by default, even if the publisher did not mark the GitHub
 release as a prerelease.
+
+## Build TUIC core from custom source
+
+Build and upgrade from an HTTPS or SSH Git remote instead of release assets:
+
+```bash
+sudo ./install-tuic.sh --upgrade-core \
+  --source-url https://github.com/owner/tuic.git \
+  --source-ref my-branch
+```
+
+`--source-ref` accepts a branch, tag, or full commit SHA; it defaults to the
+remote's `HEAD`. Use a full commit SHA to pin the exact source revision. SSH
+remotes such as `git@github.com:owner/tuic.git` use the invoking user's SSH
+configuration (normally root under `sudo`); configure authentication and host
+trust beforehand. HTTPS URLs with embedded credentials are rejected.
+
+Install a Rust toolchain compatible with the fork before running this command.
+`cargo` and `rustc` must be on the root user's PATH. The script installs Git,
+C/C++ build tools, pkg-config, OpenSSL development headers, and CMake through the
+system package manager. Additional fork-specific dependencies must be installed
+separately. The repository must contain a Cargo project at its root, a committed
+`Cargo.lock`, and a binary target named `tuic-server`, compatible with the
+existing TUIC configuration and service command. Compilation uses
+[`cargo build --release --locked`](https://doc.rust-lang.org/cargo/commands/cargo-build.html)
+with the fork's default features and toolchain configuration.
+
+Only build trusted repositories: Cargo configuration and build scripts execute
+with the installer's privileges. The script fetches into a temporary directory,
+logs the resolved commit, builds and checks the executable's `--version`, then
+atomically replaces `/usr/local/bin/tuic-server` and restarts TUIC. Fetch or build
+failure leaves the installed binary and running service untouched. Temporary
+files are cleaned up on failure. A service startup failure is reported; automatic
+rollback after replacement is not provided.
+
+The upgrade preserves the existing configuration, certificates, HTTPS frontend,
+and firewall rules. Source URL, requested ref, and resolved commit are recorded
+in `/etc/tuic/.env` if that file exists. Supply the source options on each source
+upgrade; a later plain `--upgrade-core` resumes release-binary upgrades from the
+saved GitHub release repository. `--repo` and `--source-url` cannot be combined.
+Source builds are supported only with `--upgrade-core`, after initial setup.
+Use `--dry-run` to preview the source upgrade without fetching or building.
 
 ## Repair certificate auto-renewal
 
