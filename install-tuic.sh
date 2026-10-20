@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.2.1"
+SCRIPT_VERSION="0.3.0"
 DEFAULT_UDP_PORT="443"
 DEFAULT_HTTPS_FRONT="nginx"
 DEFAULT_SITE_ROOT="/var/www/https-front"
@@ -44,6 +44,10 @@ ASSET_URL=""
 TUIC_VERSION=""
 TUIC_REPO="${TUIC_REPO_DEFAULT}"
 TUIC_REPO_EXPLICIT="false"
+SOURCE_URL=""
+SOURCE_REF="HEAD"
+SOURCE_REF_EXPLICIT="false"
+SOURCE_COMMIT=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -64,6 +68,8 @@ Options:
   --non-interactive        Fail instead of prompting for missing options
   --update                 Update mode; reuse /etc/tuic/.env when possible
   --upgrade-core           Upgrade only the TUIC server binary from the selected repo
+  --source-url <url>       Build core from an HTTPS or SSH Git remote (requires --upgrade-core)
+  --source-ref <ref>       Branch, tag, or full commit SHA to build (default: HEAD)
   --status                 Show TUIC/frontend service status and listening sockets
   --restart                Restart TUIC and the configured HTTPS frontend
   --repair-cert-renewal    Repair and verify automatic certificate renewal only
@@ -108,6 +114,15 @@ parse_args() {
       --https-front) HTTPS_FRONT="${2:-}"; shift 2 ;;
       --site-root) SITE_ROOT="${2:-}"; shift 2 ;;
       --repo) TUIC_REPO="${2:-}"; TUIC_REPO_EXPLICIT="true"; shift 2 ;;
+      --source-url|--source-ref)
+        [[ $# -ge 2 && -n "${2}" && "${2}" != --* ]] || die "$1 requires a value"
+        if [[ "$1" == "--source-url" ]]; then
+          SOURCE_URL="$2"
+        else
+          SOURCE_REF="$2"
+          SOURCE_REF_EXPLICIT="true"
+        fi
+        shift 2 ;;
       --non-interactive) NON_INTERACTIVE="true"; shift ;;
       --update) UPDATE_MODE="true"; shift ;;
       --upgrade-core|--upgrade-tuic-core) UPGRADE_CORE_MODE="true"; shift ;;
@@ -608,6 +623,74 @@ repair_certificate_renewal() {
   fi
 }
 
+# Source builds are explicitly opt-in on every run; saved provenance never changes
+# the default release upgrade path. Restrict remotes to non-local Git transports.
+validate_source_options() {
+  if [[ -z "${SOURCE_URL}" ]]; then
+    [[ "${SOURCE_REF_EXPLICIT}" == "false" ]] || die "--source-ref requires --source-url"
+    return 0
+  fi
+  [[ "${UPGRADE_CORE_MODE}" == "true" ]] || die "--source-url requires --upgrade-core"
+  [[ "${TUIC_REPO_EXPLICIT}" == "false" ]] || die "Use either --repo or --source-url"
+  [[ "${SOURCE_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/~+-]+$ ||
+     "${SOURCE_URL}" =~ ^ssh://[A-Za-z0-9._-]+@[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/~+-]+$ ||
+     "${SOURCE_URL}" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/~+-]+$ ]] ||
+    die "--source-url must be an HTTPS or SSH Git remote without embedded credentials or query parameters"
+  [[ "${SOURCE_REF}" != -* && "${SOURCE_REF}" =~ ^[A-Za-z0-9._/+~-]+$ ]] || die "Invalid --source-ref"
+}
+
+ensure_source_build_dependencies() {
+  # Do not silently install or upgrade the administrator's Rust toolchain.
+  need_cmd cargo
+  need_cmd rustc
+  log "Installing native source build dependencies"
+  run_cmd "${PKG_UPDATE_CMD[@]}"
+  if [[ "${OS_FAMILY}" == "debian" ]]; then
+    run_cmd "${PKG_INSTALL_CMD[@]}" git ca-certificates build-essential pkg-config libssl-dev cmake
+  else
+    run_cmd "${PKG_INSTALL_CMD[@]}" git ca-certificates gcc gcc-c++ make pkgconf-pkg-config openssl-devel cmake
+  fi
+}
+
+# Keep checkout, Cargo output, and staging cleanup scoped to this subshell.
+# The running binary is replaced atomically only after compilation succeeds.
+upgrade_core_from_source() (
+  local work_dir staged_bin="" artifact
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[dry-run] fetch source ref ${SOURCE_REF} from ${SOURCE_URL}"
+    log "[dry-run] cargo build --release --locked --bin tuic-server; atomically install ${TUIC_BIN}"
+    log "[dry-run] restart and verify tuic.service; record source commit in ${TUIC_ENV}"
+    return 0
+  fi
+  trap 'err "TUIC source upgrade failed (ref=${SOURCE_REF})"' ERR
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf -- "${work_dir}"; [[ -z "${staged_bin}" ]] || rm -f -- "${staged_bin}"' EXIT
+  log "Fetching TUIC source ref ${SOURCE_REF} from ${SOURCE_URL}"
+  git init -q "${work_dir}/source"
+  git -C "${work_dir}/source" remote add origin "${SOURCE_URL}"
+  GIT_TERMINAL_PROMPT=0 git -C "${work_dir}/source" fetch --depth=1 origin "${SOURCE_REF}"
+  git -C "${work_dir}/source" checkout --detach -q FETCH_HEAD
+  SOURCE_COMMIT="$(git -C "${work_dir}/source" rev-parse HEAD)"
+  log "Building TUIC source commit ${SOURCE_COMMIT}"
+  # JSON artifact reporting respects upstream Cargo target/platform configuration.
+  (cd "${work_dir}/source" && cargo build --release --locked --bin tuic-server \
+    --target-dir "${work_dir}/target" --message-format=json-render-diagnostics) > "${work_dir}/artifacts.json"
+  artifact="$(jq -sr '[.[] | select(.reason == "compiler-artifact" and .target.name == "tuic-server" and .executable != null) | .executable] | unique | if length == 1 then .[0] else empty end' "${work_dir}/artifacts.json")"
+  [[ -n "${artifact}" && -f "${artifact}" && -x "${artifact}" ]] || die "Build did not produce one executable tuic-server artifact"
+  "${artifact}" --version
+  staged_bin="$(mktemp "${TUIC_BIN}.new.XXXXXX")"
+  install -m 0755 "${artifact}" "${staged_bin}"
+  mv -f -- "${staged_bin}" "${TUIC_BIN}"
+  staged_bin=""
+  TUIC_VERSION="git:${SOURCE_COMMIT}"
+  TAG=""
+  ASSET_URL=""
+  restart_tuic_service
+  verify_tuic_service_if_installed
+  persist_core_upgrade_metadata
+  log "TUIC source upgrade completed: commit=${SOURCE_COMMIT} binary=${TUIC_BIN}"
+)
+
 resolve_latest_tuic_release() {
   log "Resolving latest stable release from ${TUIC_REPO}"
   local api release_json stable_release asset_pattern
@@ -705,6 +788,7 @@ persist_core_upgrade_metadata() {
     /^TUIC_ASSET_URL=/ { print "TUIC_ASSET_URL=" asset; seen_asset=1; next }
     /^TUIC_REPO_SAVED=/ { print "TUIC_REPO_SAVED=" repo; seen_repo=1; next }
     /^UPDATED_AT=/ { print "UPDATED_AT=" updated; seen_updated=1; next }
+    /^TUIC_SOURCE_(URL|REF|COMMIT)=/ { next }
     { print }
     END {
       if (!seen_version) print "TUIC_VERSION=" version
@@ -714,6 +798,8 @@ persist_core_upgrade_metadata() {
       if (!seen_updated) print "UPDATED_AT=" updated
     }
   ' "${TUIC_ENV}" > "${tmp}"
+  printf 'TUIC_SOURCE_URL=%s\nTUIC_SOURCE_REF=%s\nTUIC_SOURCE_COMMIT=%s\n' \
+    "${SOURCE_URL}" "${SOURCE_REF}" "${SOURCE_COMMIT}" >> "${tmp}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "[dry-run] update TUIC metadata in ${TUIC_ENV}"
     rm -f "${tmp}"
@@ -1065,6 +1151,7 @@ EOF
 main() {
   local operation_count=0
   parse_args "$@"
+  validate_source_options
   require_root
 
   [[ "${STATUS_MODE}" == "true" ]] && ((operation_count += 1))
@@ -1097,6 +1184,11 @@ main() {
     detect_os
     detect_arch
     ensure_core_upgrade_dependencies
+    if [[ -n "${SOURCE_URL}" ]]; then
+      ensure_source_build_dependencies
+      upgrade_core_from_source
+      return 0
+    fi
     resolve_latest_tuic_release
     install_tuic_binary
     restart_tuic_service
