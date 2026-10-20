@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.4.0"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/nobbbbby/ProxyServerInstaller/main/install-tuic.sh"
 DEFAULT_UDP_PORT="443"
 DEFAULT_HTTPS_FRONT="nginx"
 DEFAULT_SITE_ROOT="/var/www/https-front"
@@ -32,6 +34,7 @@ DRY_RUN="false"
 FORCE="false"
 UPDATE_MODE="false"
 UPGRADE_CORE_MODE="false"
+UPGRADE_SCRIPT_MODE="false"
 STATUS_MODE="false"
 RESTART_MODE="false"
 REPAIR_CERT_RENEWAL_MODE="false"
@@ -68,6 +71,7 @@ Options:
   --non-interactive        Fail instead of prompting for missing options
   --update                 Update mode; reuse /etc/tuic/.env when possible
   --upgrade-core           Upgrade only the TUIC server binary from the selected repo
+  --upgrade-script         Update this installer file from the official repository
   --source-url <url>       Build core from an HTTPS or SSH Git remote (requires --upgrade-core)
   --source-ref <ref>       Branch, tag, or full commit SHA to build (default: HEAD)
   --status                 Show TUIC/frontend service status and listening sockets
@@ -126,6 +130,7 @@ parse_args() {
       --non-interactive) NON_INTERACTIVE="true"; shift ;;
       --update) UPDATE_MODE="true"; shift ;;
       --upgrade-core|--upgrade-tuic-core) UPGRADE_CORE_MODE="true"; shift ;;
+      --upgrade-script) UPGRADE_SCRIPT_MODE="true"; shift ;;
       --status|status) STATUS_MODE="true"; shift ;;
       --restart|restart) RESTART_MODE="true"; shift ;;
       --repair-cert-renewal) REPAIR_CERT_RENEWAL_MODE="true"; shift ;;
@@ -136,6 +141,35 @@ parse_args() {
     esac
   done
 }
+
+# Stage beside the destination so replacement is atomic; never execute the download.
+upgrade_script() (
+  local target staged=""
+  [[ -f "${SCRIPT_PATH}" && ! -L "${SCRIPT_PATH}" ]] || die "Self-update requires a regular script file, not a symlink or piped input. Download install-tuic.sh first."
+  target="$(cd -- "$(dirname -- "${SCRIPT_PATH}")" && pwd -P)/$(basename -- "${SCRIPT_PATH}")"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[dry-run] download ${SCRIPT_UPDATE_URL}; validate and atomically replace ${target}"
+    return 0
+  fi
+  need_cmd curl
+  trap '[[ -z "${staged}" ]] || rm -f -- "${staged}"' EXIT
+  trap 'err "Installer self-update failed; destination=${target}"' ERR
+  staged="$(mktemp "${target}.new.XXXXXX")"
+  log "Downloading installer update from ${SCRIPT_UPDATE_URL}"
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 120 --retry 3 --output "${staged}" "${SCRIPT_UPDATE_URL}"
+  [[ "$(head -n 1 "${staged}")" == '#!/usr/bin/env bash' ]] || die "Downloaded file is not a Bash installer; keeping existing script."
+  grep -Eq '^SCRIPT_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$' "${staged}" || die "Downloaded installer has no valid version; keeping existing script."
+  bash -n "${staged}"
+  if cmp -s -- "${staged}" "${target}"; then
+    log "Installer is already up to date: ${target}"
+    return 0
+  fi
+  chmod 0755 "${staged}"
+  mv -f -- "${staged}" "${target}"
+  staged=""
+  log "Installer updated: ${target}. Run it again to use the new version."
+)
 
 load_runtime_env() {
   local key value line
@@ -1158,8 +1192,14 @@ main() {
   [[ "${RESTART_MODE}" == "true" ]] && ((operation_count += 1))
   [[ "${UPDATE_MODE}" == "true" ]] && ((operation_count += 1))
   [[ "${UPGRADE_CORE_MODE}" == "true" ]] && ((operation_count += 1))
+  [[ "${UPGRADE_SCRIPT_MODE}" == "true" ]] && ((operation_count += 1))
   [[ "${REPAIR_CERT_RENEWAL_MODE}" == "true" ]] && ((operation_count += 1))
   (( operation_count <= 1 )) || die "Use only one operation mode at a time."
+
+  if [[ "${UPGRADE_SCRIPT_MODE}" == "true" ]]; then
+    upgrade_script
+    return 0
+  fi
 
   if [[ "${REPAIR_CERT_RENEWAL_MODE}" == "true" ]]; then
     repair_certificate_renewal
